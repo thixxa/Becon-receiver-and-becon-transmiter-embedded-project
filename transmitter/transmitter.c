@@ -1,233 +1,263 @@
 /*
- * transmitter.c — LoRa Transmitter (Switch Controlled)
- * Target: ATmega328P @ 16 MHz
- * LoRa module: SX1278 (RFM95) at 433 MHz via SPI
+ * transmitter.c — AVR C equivalent of corected_transmiter.ino
  *
- * Pin Mapping (Arduino Uno → ATmega328P):
- *   SWITCH_PIN  = D7  → PD7
- *   SPI MOSI    = D11 → PB3
- *   SPI MISO    = D12 → PB4
- *   SPI SCK     = D13 → PB5
- *   LoRa NSS    = D10 → PB2
- *   LoRa RESET  = D9  → PB1
- *   LoRa DIO0   = D2  → PD2
+ * Target MCU : ATmega328P (Arduino Uno/Nano)
+ * F_CPU       : 16 MHz
+ *
+ * This file implements the IR-sensor line-follower logic originally in the
+ * Arduino sketch.  The original file contained two overlapping loop() blocks;
+ * the second (more complete) version — which includes Serial debug prints —
+ * is used here as the authoritative source.
+ *
+ * Pin mapping (adjust to your wiring):
+ *   IR_OUT_LEFT  = PC0  (Arduino A0)
+ *   IR_LEFT      = PC1  (Arduino A1)
+ *   IR_MID       = PC2  (Arduino A2)
+ *   IR_RIGHT     = PC3  (Arduino A3)
+ *   IR_OUT_RIGHT = PC4  (Arduino A4)
+ *
+ * Motor driver  (L298N / L293D, example):
+ *   Left motor  forward  = PD5 (OC0B PWM) and PD4 direction
+ *   Right motor forward  = PD6 (OC0A PWM) and PD7 direction
+ *   (Change motor_forward() / stop_motors() to match your driver.)
+ *
+ * Speed constants — tune to your robot:
+ *   baseSpeed  = 180  (0-255 PWM)
+ *   turnSpeed  = 120
+ *   hardTurn   = 80
+ *   searchSpeed= 130
  */
 
+#define F_CPU 16000000UL
+
 #include <avr/io.h>
-#include <avr/interrupt.h>
 #include <util/delay.h>
-#include <stdint.h>
-#include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
-/* ─────────────────────────────────────────────
-   UART  (9600 baud @ 16 MHz)
-───────────────────────────────────────────── */
-#define BAUD 9600
-#define UBRR_VAL ((F_CPU / (16UL * BAUD)) - 1)
-
-static void uart_init(void) {
-    UBRR0H = (uint8_t)(UBRR_VAL >> 8);
-    UBRR0L = (uint8_t)(UBRR_VAL);
+/* ================================================================
+ * UART helpers (9600 8N1)
+ * ================================================================ */
+static void uart_init(void)
+{
+    uint16_t ubrr = (uint16_t)(F_CPU / (16UL * 9600UL)) - 1;
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)(ubrr);
     UCSR0B = (1 << TXEN0);
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); /* 8N1 */
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
-static void uart_putc(char c) {
+static void uart_putchar(char c)
+{
     while (!(UCSR0A & (1 << UDRE0)));
-    UDR0 = c;
+    UDR0 = (uint8_t)c;
 }
 
-static void uart_puts(const char *s) {
-    while (*s) uart_putc(*s++);
+static void uart_puts(const char *s)
+{
+    while (*s) uart_putchar(*s++);
 }
 
-static void uart_putint(int16_t val) {
+static void uart_println(const char *s)
+{
+    uart_puts(s);
+    uart_puts("\r\n");
+}
+
+/* Print "KEY: VALUE " */
+static void uart_print_int_label(const char *label, int val)
+{
     char buf[8];
-    snprintf(buf, sizeof(buf), "%d", val);
+    uart_puts(label);
+    itoa(val, buf, 10);
     uart_puts(buf);
+    uart_putchar(' ');
 }
 
-/* ─────────────────────────────────────────────
-   SPI
-───────────────────────────────────────────── */
-/* NSS = PB2, SCK = PB5, MOSI = PB3, MISO = PB4 */
-#define LORA_NSS_DDR   DDRB
-#define LORA_NSS_PORT  PORTB
-#define LORA_NSS_PIN   PB2
+/* ================================================================
+ * IR sensor pin definitions  (all on PORTC / ADC pins)
+ * ================================================================ */
+#define IR_DDR   DDRC
+#define IR_PIN   PINC
 
-#define LORA_RST_DDR   DDRB
-#define LORA_RST_PORT  PORTB
-#define LORA_RST_PIN   PB1
+#define IR_OUT_LEFT_BIT  PC0
+#define IR_LEFT_BIT      PC1
+#define IR_MID_BIT       PC2
+#define IR_RIGHT_BIT     PC3
+#define IR_OUT_RIGHT_BIT PC4
 
-static void spi_init(void) {
-    /* MOSI, SCK, NSS, RST as outputs */
-    DDRB |= (1 << PB3) | (1 << PB5) | (1 << LORA_NSS_PIN) | (1 << LORA_RST_PIN);
-    DDRB &= ~(1 << PB4); /* MISO input */
-    LORA_NSS_PORT |= (1 << LORA_NSS_PIN); /* NSS high */
-    /* SPI Master, Mode 0, fosc/4 */
-    SPCR = (1 << SPE) | (1 << MSTR);
+static void ir_sensors_init(void)
+{
+    /* Set all IR pins as input, no pull-up (sensors supply their own logic) */
+    IR_DDR &= ~(
+        (1 << IR_OUT_LEFT_BIT)  |
+        (1 << IR_LEFT_BIT)      |
+        (1 << IR_MID_BIT)       |
+        (1 << IR_RIGHT_BIT)     |
+        (1 << IR_OUT_RIGHT_BIT)
+    );
 }
 
-static uint8_t spi_transfer(uint8_t data) {
-    SPDR = data;
-    while (!(SPSR & (1 << SPIF)));
-    return SPDR;
+static inline int ir_read(uint8_t bit)
+{
+    return (IR_PIN & (1 << bit)) ? 1 : 0;
 }
 
-/* ─────────────────────────────────────────────
-   SX1278 / LoRa Register Definitions
-───────────────────────────────────────────── */
-#define REG_FIFO                 0x00
-#define REG_OP_MODE              0x01
-#define REG_FRF_MSB              0x06
-#define REG_FRF_MID              0x07
-#define REG_FRF_LSB              0x08
-#define REG_PA_CONFIG            0x09
-#define REG_FIFO_ADDR_PTR        0x0D
-#define REG_FIFO_TX_BASE_ADDR    0x0E
-#define REG_FIFO_RX_BASE_ADDR    0x0F
-#define REG_IRQ_FLAGS            0x12
-#define REG_PAYLOAD_LENGTH       0x22
-#define REG_MODEM_CONFIG_1       0x1D
-#define REG_MODEM_CONFIG_2       0x1E
-#define REG_SYNC_WORD            0x39
-#define REG_DIO_MAPPING_1        0x40
-#define REG_VERSION              0x42
+/* ================================================================
+ * Motor driver (PWM on OC0A / OC0B — Timer0 fast PWM)
+ *
+ *   Left  motor  : IN1=PD4, EN1/PWM=PD5(OC0B)
+ *   Right motor  : IN2=PD7, EN2/PWM=PD6(OC0A)
+ *
+ * "forward(leftSpeed, rightSpeed)" — both values 0-255.
+ * ================================================================ */
+#define MTR_DDR    DDRD
+#define MTR_PORT   PORTD
 
-#define MODE_LONG_RANGE_MODE     0x80
-#define MODE_SLEEP               0x00
-#define MODE_STDBY               0x01
-#define MODE_TX                  0x03
-#define MODE_RX_CONTINUOUS       0x05
+#define L_DIR_PIN  PD4
+#define L_PWM_PIN  PD5   /* OC0B */
+#define R_DIR_PIN  PD7
+#define R_PWM_PIN  PD6   /* OC0A */
 
-#define PA_BOOST                 0x80
+static void motors_init(void)
+{
+    MTR_DDR |= (1 << L_DIR_PIN) | (1 << L_PWM_PIN) |
+               (1 << R_DIR_PIN) | (1 << R_PWM_PIN);
 
-#define IRQ_TX_DONE_MASK         0x08
+    /* Timer0: Fast PWM, non-inverting on OC0A & OC0B, prescaler 64 */
+    TCCR0A = (1 << COM0A1) | (1 << COM0B1) |
+             (1 << WGM01)  | (1 << WGM00);
+    TCCR0B = (1 << CS01)   | (1 << CS00);  /* clk/64 → ~976 Hz PWM */
 
-static uint8_t lora_read_reg(uint8_t addr) {
-    LORA_NSS_PORT &= ~(1 << LORA_NSS_PIN);
-    spi_transfer(addr & 0x7F);
-    uint8_t val = spi_transfer(0x00);
-    LORA_NSS_PORT |= (1 << LORA_NSS_PIN);
-    return val;
+    OCR0A = 0;
+    OCR0B = 0;
 }
 
-static void lora_write_reg(uint8_t addr, uint8_t val) {
-    LORA_NSS_PORT &= ~(1 << LORA_NSS_PIN);
-    spi_transfer(addr | 0x80);
-    spi_transfer(val);
-    LORA_NSS_PORT |= (1 << LORA_NSS_PIN);
+static void forward(uint8_t left_speed, uint8_t right_speed)
+{
+    /* Direction pins HIGH = forward for both motors */
+    MTR_PORT |=  (1 << L_DIR_PIN) | (1 << R_DIR_PIN);
+    OCR0B = left_speed;
+    OCR0A = right_speed;
 }
 
-static uint8_t lora_begin(void) {
-    /* Hardware reset */
-    LORA_RST_PORT &= ~(1 << LORA_RST_PIN);
-    _delay_ms(10);
-    LORA_RST_PORT |= (1 << LORA_RST_PIN);
-    _delay_ms(10);
-
-    /* Check version */
-    uint8_t version = lora_read_reg(REG_VERSION);
-    if (version != 0x12) return 0; /* SX1278 not found */
-
-    /* Sleep → LoRa mode */
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
-    _delay_ms(10);
-
-    /* Set frequency: 433 MHz
-       Fstep = 32e6 / 2^19 = 61.035 Hz
-       FRF   = 433e6 / 61.035 = 7094272 = 0x6C8000 */
-    lora_write_reg(REG_FRF_MSB, 0x6C);
-    lora_write_reg(REG_FRF_MID, 0x80);
-    lora_write_reg(REG_FRF_LSB, 0x00);
-
-    /* PA: +17 dBm via PA_BOOST */
-    lora_write_reg(REG_PA_CONFIG, PA_BOOST | 0x0F);
-
-    /* BW=125kHz, CR=4/5, Implicit header off */
-    lora_write_reg(REG_MODEM_CONFIG_1, 0x72);
-    /* SF=7, CRC on */
-    lora_write_reg(REG_MODEM_CONFIG_2, 0x74);
-
-    /* Sync word 0x12 (public network) */
-    lora_write_reg(REG_SYNC_WORD, 0x12);
-
-    /* Base addresses */
-    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
-    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
-
-    /* Standby */
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-    return 1;
+static void stop_motors(void)
+{
+    OCR0A = 0;
+    OCR0B = 0;
 }
 
-static void lora_send_packet(const uint8_t *data, uint8_t len) {
-    /* Standby */
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
+/* ================================================================
+ * Speed constants — tune as needed
+ * ================================================================ */
+#define BASE_SPEED    180
+#define TURN_SPEED    120
+#define HARD_TURN      80
+#define SEARCH_SPEED  130
 
-    /* Reset FIFO pointer */
-    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-
-    /* Write payload */
-    for (uint8_t i = 0; i < len; i++) {
-        lora_write_reg(REG_FIFO, data[i]);
-    }
-    lora_write_reg(REG_PAYLOAD_LENGTH, len);
-
-    /* TX mode */
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
-
-    /* Wait for TX done */
-    while ((lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) == 0);
-
-    /* Clear IRQ */
-    lora_write_reg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
-}
-
-/* ─────────────────────────────────────────────
-   Switch — PD7 (D7), active LOW
-───────────────────────────────────────────── */
-#define SWITCH_DDR   DDRD
-#define SWITCH_PORT  PORTD
-#define SWITCH_PIN_R PIND
-#define SWITCH_BIT   PD7
-
-/* ─────────────────────────────────────────────
-   Main
-───────────────────────────────────────────── */
-int main(void) {
+/* ================================================================
+ * main
+ * ================================================================ */
+int main(void)
+{
     uart_init();
-    spi_init();
+    ir_sensors_init();
+    motors_init();
 
-    /* Switch: input with pull-up */
-    SWITCH_DDR  &= ~(1 << SWITCH_BIT);
-    SWITCH_PORT |=  (1 << SWITCH_BIT);
+    int last_direction = 0;  /* -1 = last turned left, 1 = right, 0 = straight */
 
-    uart_puts("LoRa Sender (Switch Controlled)\r\n");
+    while (1)
+    {
+        /* ===== READ SENSOR VALUES ===== */
+        int OL = ir_read(IR_OUT_LEFT_BIT);
+        int L  = ir_read(IR_LEFT_BIT);
+        int M  = ir_read(IR_MID_BIT);
+        int R  = ir_read(IR_RIGHT_BIT);
+        int OR = ir_read(IR_OUT_RIGHT_BIT);
 
-    if (!lora_begin()) {
-        uart_puts("Starting LoRa failed!\r\n");
-        while (1);
-    }
+        /* ===== PRINT SENSOR VALUES ===== */
+        uart_print_int_label("OL: ", OL);
+        uart_print_int_label(" L: ", L);
+        uart_print_int_label(" M: ", M);
+        uart_print_int_label(" R: ", R);
+        uart_print_int_label(" OR:", OR);
+        uart_puts("\r\n");
 
-    uint16_t counter = 0;
-
-    while (1) {
-        if (!(SWITCH_PIN_R & (1 << SWITCH_BIT))) { /* Switch ON (LOW) */
-            uart_puts("Sending packet: ");
-            uart_putint((int16_t)counter);
-            uart_puts("\r\n");
-
-            /* Build payload: "hello <counter>" */
-            char payload[24];
-            snprintf(payload, sizeof(payload), "hello %u", counter);
-            lora_send_packet((uint8_t *)payload, (uint8_t)strlen(payload));
-
-            counter++;
-            _delay_ms(5000);
-        } else {
-            _delay_ms(100);
+        /* ===== LINE FOLLOW LOGIC ===== */
+        if (L == 0 && M == 1 && R == 0)
+        {
+            uart_println("Forward");
+            forward(BASE_SPEED, BASE_SPEED);
+            last_direction = 0;
         }
+        else if (L == 1 && M == 0 && R == 0)
+        {
+            uart_println("Turn Left");
+            forward(TURN_SPEED, BASE_SPEED);
+            last_direction = -1;
+        }
+        else if (L == 0 && M == 0 && R == 1)
+        {
+            uart_println("Turn Right");
+            forward(BASE_SPEED, TURN_SPEED);
+            last_direction = 1;
+        }
+        else if (L == 1 && M == 1 && R == 0)
+        {
+            uart_println("Hard Left");
+            forward(HARD_TURN, BASE_SPEED);
+            last_direction = -1;
+        }
+        else if (L == 0 && M == 1 && R == 1)
+        {
+            uart_println("Hard Right");
+            forward(BASE_SPEED, HARD_TURN);
+            last_direction = 1;
+        }
+        else if ((L == 1 && M == 0 && R == 1) || (L == 1 && M == 1 && R == 1))
+        {
+            uart_println("Straight (All/Center case)");
+            forward(BASE_SPEED, BASE_SPEED);
+        }
+        else if (L == 0 && M == 0 && R == 0)
+        {
+            uart_println("Searching...");
+            if (OL == 1)
+            {
+                uart_println("Search Left");
+                forward(SEARCH_SPEED, BASE_SPEED);
+            }
+            else if (OR == 1)
+            {
+                uart_println("Search Right");
+                forward(BASE_SPEED, SEARCH_SPEED);
+            }
+            else
+            {
+                uart_println("Search Last Direction");
+                if (last_direction == -1)
+                    forward(SEARCH_SPEED, BASE_SPEED);
+                else
+                    forward(BASE_SPEED, SEARCH_SPEED);
+            }
+        }
+        else
+        {
+            uart_println("Stop");
+            stop_motors();
+        }
+
+        /* ===== RUN FOR 1 SECOND ===== */
+        uart_println("Running...");
+        _delay_ms(1000);
+
+        /* ===== STOP FOR 0.5 SECOND ===== */
+        uart_println("Stopped");
+        stop_motors();
+        _delay_ms(500);
+
+        uart_println("----------------------");
     }
+
+    return 0; /* never reached */
 }
