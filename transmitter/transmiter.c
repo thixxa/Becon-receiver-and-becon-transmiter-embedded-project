@@ -11,25 +11,25 @@
 #define LED_PIN        PD4
 #define DHTPIN         PD3
 
-// SPI Pins (ATmega328P)
-#define SS   PB2
-#define MOSI PB3
-#define MISO PB4
-#define SCK  PB5
+// SPI Pins (ATmega328P) used for LoRa SX1278
+#define SS   PB2        // Slave Select(select LoRa)
+#define MOSI PB3        // Master Out Slave In (send data from microcontroller to LoRa)
+#define MISO PB4        // Master In Slave Out (receive data from LoRa, not used in this project)
+#define SCK  PB5        // Serial Clock (clock signal for synchronization)
 
 // ---------------- GLOBAL VARIABLES ----------------
-int counter = 0;
-uint8_t transmitMode = 0;
-uint8_t lastVibrationState = 0;
-uint8_t lastResetState = 1;
+int counter = 0;                    // counts sent packets
+uint8_t transmitMode = 0;           // decides whether to send data
+uint8_t lastVibrationState = 0;     // detect edge
+uint8_t lastResetState = 1;         // detect reset release
 
-float lastHumidity = 0;
-uint8_t firstRead = 1;
+float lastHumidity = 0;             // compare changes
+uint8_t firstRead = 1;              // initialize first value
 
 // ---------------- UART (for debugging) ----------------
 void UART_init() {
     UBRR0H = 0;
-    UBRR0L = 103; // 9600 baud
+    UBRR0L = 103;                   // 9600 baud
     UCSR0B = (1 << TXEN0);
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
@@ -51,6 +51,7 @@ void SPI_init() {
     SPCR = (1 << SPE) | (1 << MSTR) | (1 << SPR0);
 }
 
+// sends and receives 1 byte over SPI
 uint8_t SPI_transfer(uint8_t data) {
     SPDR = data;
     while (!(SPSR & (1 << SPIF)));
@@ -58,6 +59,7 @@ uint8_t SPI_transfer(uint8_t data) {
 }
 
 // ---------------- LoRa (Basic SX1278 Write) ----------------
+// write data into LoRa module registers
 void LoRa_writeRegister(uint8_t addr, uint8_t value) {
     PORTB &= ~(1 << SS);
     SPI_transfer(addr | 0x80);
@@ -84,7 +86,7 @@ void LoRa_sendPacket(char *data) {
     _delay_ms(100);
 }
 
-// ---------------- DHT11 ----------------
+// ---------------- DHT11 humidity sensor reading ---------------
 uint8_t DHT_read(float *humidity) {
     uint8_t data[5] = {0};
 
@@ -113,7 +115,7 @@ uint8_t DHT_read(float *humidity) {
         while (PIND & (1 << DHTPIN));
     }
 
-    *humidity = data[0]; // integer part only
+    *humidity = data[0];                // only integer humidity is used
     return 1;
 }
 
@@ -133,17 +135,17 @@ int main(void) {
 
         uint8_t resetState = (PIND & (1 << RESET_SWITCH)) ? 1 : 0;
 
-        // RESET LOW → disable
+        // when reset button pressed
         if (resetState == 0) {
-            transmitMode = 0;
-            PORTD &= ~(1 << LED_PIN);
+            transmitMode = 0;               // stop transmitting
+            PORTD &= ~(1 << LED_PIN);       // turn off LED
         }
 
-        // RESET rising edge
+        // when reset button released
         if (lastResetState == 0 && resetState == 1) {
             UART_print("System Reset Complete\n");
-            transmitMode = 0;
-            counter = 0;
+            transmitMode = 0;               // reset state
+            counter = 0;                    // reset packet counter
             firstRead = 1;
         }
 
@@ -156,12 +158,12 @@ int main(void) {
 
             float humidity = 0;
 
-            // START
+            // manual start
             if (startState == 0) {
                 transmitMode = 1;
             }
 
-            // VIBRATION edge
+            // trigger on vibration detected (rising edge)
             if (vibrationState == 1 && lastVibrationState == 0) {
                 transmitMode = 1;
             }
@@ -176,7 +178,8 @@ int main(void) {
                 }
 
                 float increase = humidity - lastHumidity;
-
+                
+                // if humidity increased by more than 10% since last read, start transmission
                 if (increase > 10.0) {
                     UART_print("Humidity Increased >10%\n");
                     transmitMode = 1;

@@ -29,10 +29,10 @@
 #include <stdio.h>
 #include <math.h>
 
-/* ---- bring in your AVR C peripheral drivers ---- */
-#include "lora.h"        /* SX127x LoRa driver  */
-#include "i2c_master.h"  /* Peter Fleury TWI    */
-#include "i2c_lcd.h"     /* I2C LCD 16x2        */
+// bring in AVR C peripheral drivers 
+#include "lora.h"                   //SX127x LoRa driver  
+#include "i2c_master.h"             //Peter Fleury TWI    
+#include "i2c_lcd.h"                // I2C LCD 16x2        
 
 /* ================================================================
  * LED pin definitions
@@ -57,17 +57,15 @@
 #define LED4_DDR   DDRB
 #define LED4_PIN   PB0
 
-/* ================================================================
- * UART helpers (9600, 8N1)
- * ================================================================ */
+// UART helpers (9600, 8N1)
 static void uart_init(void)
 {
-    /* UBRR = F_CPU / (16 * baud) - 1 */
+    // UBRR = F_CPU / (16 * baud) - 1 
     uint16_t ubrr = (uint16_t)(F_CPU / (16UL * 9600UL)) - 1;
     UBRR0H = (uint8_t)(ubrr >> 8);
     UBRR0L = (uint8_t)(ubrr);
-    UCSR0B = (1 << TXEN0);                  /* TX enable                */
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);/* 8-bit, 1 stop, no parity */
+    UCSR0B = (1 << TXEN0);                          //TX enable                
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);         //8-bit, 1 stop, no parity 
 }
 
 static void uart_putchar(char c)
@@ -81,19 +79,18 @@ static void uart_puts(const char *s)
     while (*s) uart_putchar(*s++);
 }
 
-/* Minimal printf-style float printer: prints val with 'decimals' d.p. */
+//Minimal printf-style float printer: prints val with 'decimals' d.p. 
 static void uart_print_float(float val, uint8_t decimals)
 {
     char buf[16];
-    /* Use dtostrf from avr-libc */
+    // Use dtostrf from avr-libc
     extern char *dtostrf(double, signed char, unsigned char, char *);
     dtostrf((double)val, 6, decimals, buf);
     uart_puts(buf);
 }
 
-/* ================================================================
- * LED helpers
- * ================================================================ */
+
+// LED helpers
 static void leds_init(void)
 {
     LED1_DDR |= (1 << LED1_PIN);
@@ -117,68 +114,65 @@ static inline void led4_on(void) { LED4_PORT |= (1 << LED4_PIN); }
 
 static inline void led1_off(void) { LED1_PORT &= ~(1 << LED1_PIN); }
 
-/* ================================================================
- * Distance model parameters
- * ================================================================ */
-#define RSSI_0  (-40.0f)   /* RSSI at 1 metre      */
-#define N_EXP     2.7f     /* path-loss exponent   */
-#define D0        1.0f     /* reference distance m */
+
+// Distance model parameters
+#define RSSI_0  (-40.0f)                // RSSI at 1 metre      
+#define N_EXP     2.7f                  // path-loss exponent   
+#define D0        1.0f                  // reference distance m 
 
 static float calculate_distance(int rssi)
 {
     return D0 * powf(10.0f, (RSSI_0 - (float)rssi) / (10.0f * N_EXP));
 }
 
-/* ================================================================
- * main
- * ================================================================ */
+
+// main
 int main(void)
 {
-    /* --- UART --- */
+    //  UART 
     uart_init();
 
-    /* --- LEDs --- */
+    //  LEDs 
     leds_init();
     all_leds_off();
 
-    /* --- I2C + LCD --- */
-    i2c_init();                          /* TWI initialise             */
-    lcd_init(LCD_DISP_ON);               /* 16x2, display on           */
+    // I2C + LCD  
+    i2c_init();                          // TWI initialise             
+    lcd_init(LCD_DISP_ON);               // 16x2, display on           
     lcd_clrscr();
     lcd_puts("LoRa Receiver");
 
-    /* --- LoRa --- */
-    if (lora_begin(433E6) != 0) {        /* 0 = success in AVR driver  */
+    // LoRa 
+    if (lora_begin(433E6) != 0) {        // 0 = success in AVR driver  
         lcd_gotoxy(0, 1);
         lcd_puts("LoRa Failed");
-        while (1);                       /* halt */
+        while (1);                       // halt if LoRa init fails
     }
 
     lcd_gotoxy(0, 1);
     lcd_puts("Waiting...");
 
-    /* ================================================================
-     * Main loop
-     * ================================================================ */
+
+    // Main loop
     while (1)
     {
         int packet_size = lora_parse_packet(0);
 
         if (packet_size > 0)
         {
-            /* Drain incoming bytes (we only need RSSI) */
+            // Drain incoming bytes (we only need RSSI) 
             while (lora_available())
                 lora_read();
 
             int rssi     = lora_packet_rssi();
             float dist   = calculate_distance(rssi);
 
-            /* --- Serial output --- */
+            // Serial output
             uart_puts("Distance: ");
             uart_print_float(dist, 2);
             uart_puts(" m\r\n");
 
-            /* --- LCD output --- */
+            // LCD output
             lcd_clrscr();
             lcd_gotoxy(0, 0);
             lcd_puts("Distance:");
@@ -191,28 +185,28 @@ int main(void)
             }
             lcd_puts(" m");
 
-            /* --- LED logic (cumulative) --- */
+            // LED logic (cumulative)
             all_leds_off();
 
-            if (dist > 60.0f)           /* VERY FAR — blink LED1 */
+            if (dist > 60.0f)           // VERY FAR — blink LED1 
             {
                 led1_on();
                 _delay_ms(300);
                 led1_off();
                 _delay_ms(300);
             }
-            else if (dist > 40.0f)      /* FAR */
+            else if (dist > 40.0f)      // FAR 
             {
                 led1_on();
                 led2_on();
             }
-            else if (dist > 20.0f)      /* NEAR */
+            else if (dist > 20.0f)      // NEAR
             {
                 led1_on();
                 led2_on();
                 led3_on();
             }
-            else                        /* VERY NEAR */
+            else                        // VERY NEAR
             {
                 led1_on();
                 led2_on();
@@ -222,5 +216,5 @@ int main(void)
         }
     }
 
-    return 0; /* never reached */
+    return 0; // never reached
 }
